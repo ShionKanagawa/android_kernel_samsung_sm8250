@@ -2,43 +2,62 @@
 #include <linux/fs.h>
 #include <linux/kobject.h>
 #include <linux/module.h>
-#include <linux/workqueue.h>
+#include <generated/utsrelease.h>
+#include <generated/compile.h>
+#include <linux/version.h> /* LINUX_VERSION_CODE, KERNEL_VERSION macros */
 
 #include "allowlist.h"
-#include "arch.h"
 #include "core_hook.h"
+#include "feature.h"
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
 #include "throne_tracker.h"
+#include "sucompat.h"
+#include "ksud.h"
+#include "supercalls.h"
 
-static struct workqueue_struct *ksu_workqueue;
+#ifdef CONFIG_KSU_KPROBES_KSUD
+extern void kp_ksud_init();
+#endif
 
-bool ksu_queue_work(struct work_struct *work)
-{
-	return queue_work(ksu_workqueue, work);
-}
+extern void ksu_supercalls_init();
 
-extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
-					void *argv, void *envp, int *flags);
+// track backports and other quirks here
+// ref: kernel_compat.c, Makefile
+// yes looks nasty
+#if defined(CONFIG_KSU_KPROBES_KSUD)
+	#define FEAT_1 " +kprobes_ksud"
+#else
+	#define FEAT_1 ""
+#endif
 
-extern int ksu_handle_execveat_ksud(int *fd, struct filename **filename_ptr,
-				    void *argv, void *envp, int *flags);
+#if defined(CONFIG_KSU_KRETPROBES_SUCOMPAT)
+	#define FEAT_2 " +kretprobes_sucompat"
+#else
+	#define FEAT_2 ""
+#endif
+#if defined(CONFIG_KSU_EXTRAS)
+	#define FEAT_3 " +extras"
+#else
+	#define FEAT_3 ""
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0) && !defined(CONFIG_KSU_LSM_SECURITY_HOOKS)
+	#define FEAT_4 " -lsm_hooks"
+#else
+	#define FEAT_4 ""
+#endif
+#if !(LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)) && defined(KSU_HAS_PATH_UMOUNT)
+	#define FEAT_5 " +path_umount"
+#else
+	#define FEAT_5 ""
+#endif
 
-int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
-			void *envp, int *flags)
-{
-	ksu_handle_execveat_ksud(fd, filename_ptr, argv, envp, flags);
-	return ksu_handle_execveat_sucompat(fd, filename_ptr, argv, envp,
-					    flags);
-}
-
-extern void ksu_sucompat_init();
-extern void ksu_sucompat_exit();
-extern void ksu_ksud_init();
-extern void ksu_ksud_exit();
+#define EXTRA_FEATURES FEAT_1 FEAT_2 FEAT_3 FEAT_4 FEAT_5
 
 int __init kernelsu_init(void)
 {
+	pr_info("Initialized on: %s (%s) with ksuver: %s%s\n", UTS_RELEASE, UTS_MACHINE, __stringify(KSU_VERSION), EXTRA_FEATURES);
+
 #ifdef CONFIG_KSU_DEBUG
 	pr_alert("*************************************************************");
 	pr_alert("**     NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE    **");
@@ -49,26 +68,26 @@ int __init kernelsu_init(void)
 	pr_alert("*************************************************************");
 #endif
 
-	ksu_core_init();
+	ksu_feature_init();
 
-	ksu_workqueue = alloc_ordered_workqueue("kernelsu_work_queue", 0);
+	ksu_supercalls_init();
+
+	ksu_core_init();
 
 	ksu_allowlist_init();
 
 	ksu_throne_tracker_init();
 
-#ifdef CONFIG_KPROBES
-	ksu_sucompat_init();
-	ksu_ksud_init();
-#else
-	pr_alert("KPROBES is disabled, KernelSU may not work, please check https://kernelsu.org/guide/how-to-integrate-for-non-gki.html");
+	ksu_sucompat_init(); // so the feature is registered
+
+#ifdef CONFIG_KSU_EXTRAS
+	ksu_avc_spoof_init(); // so the feature is registered
 #endif
 
-#ifdef MODULE
-#ifndef CONFIG_KSU_DEBUG
-	kobject_del(&THIS_MODULE->mkobj.kobj);
+#ifdef CONFIG_KSU_KPROBES_KSUD
+	kp_ksud_init();
 #endif
-#endif
+
 	return 0;
 }
 
@@ -78,14 +97,7 @@ void kernelsu_exit(void)
 
 	ksu_throne_tracker_exit();
 
-	destroy_workqueue(ksu_workqueue);
-
-#ifdef CONFIG_KPROBES
-	ksu_ksud_exit();
-	ksu_sucompat_exit();
-#endif
-
-	ksu_core_exit();
+	ksu_feature_exit();
 }
 
 module_init(kernelsu_init);
@@ -95,6 +107,9 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("weishu");
 MODULE_DESCRIPTION("Android KernelSU");
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 #endif
+

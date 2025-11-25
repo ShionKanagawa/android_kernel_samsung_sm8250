@@ -17,18 +17,12 @@
 #include "apk_sign.h"
 #include "klog.h" // IWYU pragma: keep
 #include "kernel_compat.h"
+#include "throne_tracker.h"
 
 
 struct sdesc {
 	struct shash_desc shash;
 	char ctx[];
-};
-
-static struct apk_sign_key {
-	unsigned size;
-	const char *sha256;
-} apk_sign_keys[] = {
-	{EXPECTED_SIZE, EXPECTED_HASH},
 };
 
 static struct sdesc *init_sdesc(struct crypto_shash *alg)
@@ -37,7 +31,7 @@ static struct sdesc *init_sdesc(struct crypto_shash *alg)
 	int size;
 
 	size = sizeof(struct shash_desc) + crypto_shash_descsize(alg);
-	sdesc = kmalloc(size, GFP_KERNEL);
+	sdesc = kzalloc(size, GFP_KERNEL);
 	if (!sdesc)
 		return ERR_PTR(-ENOMEM);
 	sdesc->shash.tfm = alg;
@@ -78,15 +72,9 @@ static int ksu_sha256(const unsigned char *data, unsigned int datalen,
 	return ret;
 }
 
-static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset)
+static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset,
+			unsigned expected_size, const char *expected_sha256)
 {
-#define CERT_MAX_LENGTH 1024
-	int i;
-	struct apk_sign_key sign_key;
-	char cert[CERT_MAX_LENGTH];
-	unsigned char digest[SHA256_DIGEST_SIZE];
-	char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
-
 	ksu_kernel_read_compat(fp, size4, 0x4, pos); // signer-sequence length
 	ksu_kernel_read_compat(fp, size4, 0x4, pos); // signer length
 	ksu_kernel_read_compat(fp, size4, 0x4, pos); // signed data length
@@ -100,31 +88,31 @@ static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset)
 
 	ksu_kernel_read_compat(fp, size4, 0x4, pos); // certificates length
 	ksu_kernel_read_compat(fp, size4, 0x4, pos); // certificate length
+	*offset += 0x4 * 2;
 
-	*offset += 0x4 * 2 + *size4;
+	if (*size4 == expected_size) {
+		*offset += *size4;
 
-	if (*size4 > CERT_MAX_LENGTH) {
-		pr_info("cert length overlimit\n");
-		return false;
-	}
-	ksu_kernel_read_compat(fp, cert, *size4, pos);
-	if (IS_ERR(ksu_sha256(cert, *size4, digest))) {
-		pr_info("sha256 error\n");
-		return false;
-	}
+#define CERT_MAX_LENGTH 1024
+		char cert[CERT_MAX_LENGTH];
+		if (*size4 > CERT_MAX_LENGTH) {
+			pr_info("cert length overlimit\n");
+			return false;
+		}
+		ksu_kernel_read_compat(fp, cert, *size4, pos);
+		unsigned char digest[SHA256_DIGEST_SIZE];
+		if (ksu_sha256(cert, *size4, digest) < 0 ) {
+			pr_info("sha256 error\n");
+			return false;
+		}
 
-	hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
-	bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
+		char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
+		hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
 
-	for (i = 0; i < ARRAY_SIZE(apk_sign_keys); i++) {
-		sign_key = apk_sign_keys[i];
-
-		if (*size4 != sign_key.size)
-			continue;
-
+		bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
 		pr_info("sha256: %s, expected: %s\n", hash_str,
-			sign_key.sha256);
-		if (strcmp(sign_key.sha256, hash_str) == 0) {
+			expected_sha256);
+		if (strcmp(expected_sha256, hash_str) == 0) {
 			return true;
 		}
 	}
@@ -184,7 +172,9 @@ static bool has_v1_signature_file(struct file *fp)
 	return false;
 }
 
-static __always_inline bool check_v2_signature(char *path)
+static __always_inline bool check_v2_signature(char *path,
+					       unsigned expected_size,
+					       const char *expected_sha256)
 {
 	unsigned char buffer[0x11] = { 0 };
 	u32 size4;
@@ -198,9 +188,26 @@ static __always_inline bool check_v2_signature(char *path)
 	bool v3_1_signing_exist = false;
 
 	int i;
+	struct path kpath;
+	if (kern_path(path, 0, &kpath))
+		return false;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0) 
+	if (inode_is_locked(kpath.dentry->d_inode))
+#else
+	if (mutex_is_locked(&kpath.dentry->d_inode->i_mutex))
+#endif
+	{
+		pr_info("%s: inode is locked for %s\n", __func__, path);
+		path_put(&kpath);
+		return false;
+	}
+
+	path_put(&kpath);
+
 	struct file *fp = ksu_filp_open_compat(path, O_RDONLY, 0);
 	if (IS_ERR(fp)) {
-		pr_err("open %s error.\n", path);
+		// pr_err("open %s error.\n", path);
 		return false;
 	}
 
@@ -210,7 +217,7 @@ static __always_inline bool check_v2_signature(char *path)
 	// https://en.wikipedia.org/wiki/Zip_(file_format)#End_of_central_directory_record_(EOCD)
 	for (i = 0;; ++i) {
 		unsigned short n;
-		pos = generic_file_llseek(fp, -i - 2, SEEK_END);
+		pos = vfs_llseek(fp, -i - 2, SEEK_END);
 		ksu_kernel_read_compat(fp, &n, 2, &pos);
 		if (n == i) {
 			pos -= 22;
@@ -232,7 +239,8 @@ static __always_inline bool check_v2_signature(char *path)
 
 	ksu_kernel_read_compat(fp, &size8, 0x8, &pos);
 	ksu_kernel_read_compat(fp, buffer, 0x10, &pos);
-	if (strcmp((char *)buffer, "APK Sig Block 42")) {
+	// !! remove this casting to char just to strcmp
+	if (memcmp(buffer, "APK Sig Block 42", 16)) {
 		goto clean;
 	}
 
@@ -255,7 +263,9 @@ static __always_inline bool check_v2_signature(char *path)
 		offset = 4;
 		if (id == 0x7109871au) {
 			v2_signing_blocks++;
-			v2_signing_valid = check_block(fp, &size4, &pos, &offset);
+			v2_signing_valid =
+				check_block(fp, &size4, &pos, &offset,
+					    expected_size, expected_sha256);
 		} else if (id == 0xf05368c0u) {
 			// http://aospxref.com/android-14.0.0_r2/xref/frameworks/base/core/java/android/util/apk/ApkSignatureSchemeV3Verifier.java#73
 			v3_signing_exist = true;
@@ -325,5 +335,25 @@ module_param_cb(ksu_debug_manager_uid, &expected_size_ops,
 
 bool is_manager_apk(char *path)
 {
-	return check_v2_signature(path);
+	int tries = 0;
+
+	while (tries++ < 10) {
+		if (!is_lock_held(path))
+			break;
+
+		pr_info("%s: waiting for %s\n", __func__, path);
+		msleep(100);
+	}
+
+	// let it go, if retry fails, check_v2_signature will fail to open it anyway
+	if (tries == 10) {
+		pr_info("%s: timeout for %s\n", __func__, path);
+		return false;
+	}
+
+	return (check_v2_signature(path, 0x363, "4359c171f32543394cbc23ef908c4bb94cad7c8087002ba164c8230948c21549") // dummy.keystore
+	|| check_v2_signature(path, EXPECTED_SIZE, EXPECTED_HASH)  // kernelsu official
+	|| check_v2_signature(path, 0x375, "484fcba6e6c43b1fb09700633bf2fb4758f13cb0b2f4457b80d075084b26c588")  // KOWX712/KernelSU
+	|| check_v2_signature(path, 0x396, "f415f4ed9435427e1fdf7f1fccd4dbc07b3d6b8751e4dbcec6f19671f427870b")  // rsuntk/KernelSU/
+	);
 }

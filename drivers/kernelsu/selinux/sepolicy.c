@@ -6,9 +6,22 @@
 #include "sepolicy.h"
 #include "../klog.h" // IWYU pragma: keep
 #include "ss/symtab.h"
-#include "../kernel_compat.h" // Add check Huawei Device
 
 #define KSU_SUPPORT_ADD_TYPE
+
+/*
+ * Adapt to Huawei HISI kernel without affecting other kernels ,
+ * Huawei Hisi Kernel EBITMAP Enable or Disable Flag ,
+ * From ss/ebitmap.h
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0) &&                           \
+		LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||               \
+	LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0) &&                      \
+		LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+#ifdef HISI_SELINUX_EBITMAP_RO
+#define CONFIG_IS_HW_HISI
+#endif
+#endif
 
 //////////////////////////////////////////////////////
 // Declaration
@@ -355,7 +368,7 @@ static void add_xperm_rule_raw(struct policydb *db, struct type_datum *src,
 
 		if (datum->u.xperms == NULL) {
 			datum->u.xperms =
-				(struct avtab_extended_perms *)(kmalloc(
+				(struct avtab_extended_perms *)(kzalloc(
 					sizeof(xperms), GFP_KERNEL));
 			if (!datum->u.xperms) {
 				pr_err("alloc xperms failed\n");
@@ -555,7 +568,7 @@ static bool add_filename_trans(struct policydb *db, const char *s,
 		trans = (struct filename_trans_datum *)kcalloc(sizeof(*trans),
 							       1, GFP_ATOMIC);
 		struct filename_trans_key *new_key =
-			(struct filename_trans_key *)kmalloc(sizeof(*new_key),
+			(struct filename_trans_key *)kzalloc(sizeof(*new_key),
 							     GFP_ATOMIC);
 		*new_key = key;
 		new_key->name = kstrdup(key.name, GFP_ATOMIC);
